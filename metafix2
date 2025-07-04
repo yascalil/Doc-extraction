@@ -1,0 +1,102 @@
+import json
+import re
+import os
+def find_definition_data(definitions_path):
+    try:
+        with open(definitions_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if 'definitions' in data and isinstance(data['definitions'], list):
+                for definition_obj in data['definitions']:
+                    if 'term' in definition_obj and definition_obj['term'].lower() == 'initial reference portfolio notional amount':
+                        return definition_obj.get('definition')
+            else:
+                print("Error: Expected 'definitions' key with a list of objects in the JSON.")
+                return None
+    except FileNotFoundError:
+        print(f"Error: The file '{definitions_path}' was not found.")
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from '{definitions_path}'. Check if it's a valid JSON file.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    return None
+def parse_definition(definition_text):
+    if not definition_text:
+        return None, None
+    match = re.search(r'([A-Z]{3})\s+([0-9,.]+)', definition_text, re.IGNORECASE)
+    if match:
+        currency = match.group(1).upper()
+        amount_str = match.group(2).replace(',', '').rstrip('.')
+        try:
+            amount = float(amount_str)
+            return currency, amount
+        except ValueError:
+            print(f"Error: Could not convert '{amount_str}' to a float after cleaning.")
+            return None, None
+    print(f"warning: could not parse currency and amount from definition: '{definition_text}'")
+    return None, None
+def update_metadata_in_memory(metadata_path, currency, amount):
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        # Ensure the key exists with value "number" before updating
+        if "Initial_Reference_Portfolio_Notional_Amount" not in metadata:
+            metadata["Initial_Reference_Portfolio_Notional_Amount"] = "number"
+            print('Added "Initial_Reference_Portfolio_Notional_Amount": "number" to metadata (pre-update).')
+        # Now update as before
+        metadata['currency'] = currency
+        formatted_amount = f"{int(amount):,}"
+        metadata['Initial_Reference_Portfolio_Notional_Amount'] = formatted_amount
+        print(f"Successfully prepared metadata updates in memory!")
+        print(f"  - Currency set to: \"{currency}\"")
+        print(f"  - Initial_Reference_Portfolio_Notional_Amount set to: \"{formatted_amount}\"")
+        return metadata
+    except FileNotFoundError:
+        print(f"Error: The metadata file '{metadata_path}' was not found.")
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from '{metadata_path}'.")
+    except KeyError as e:
+        print(f"Error: The metadata file is missing an expected key: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred while updating metadata: {e}")
+    return None
+def find_file_recursive(root_folder, filename):
+    for dirpath, _, files in os.walk(root_folder):
+        if filename in files:
+            return os.path.join(dirpath, filename)
+    return None
+def main():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    input_folder = os.path.join(base_dir, 'defi+meta')
+    output_folder = os.path.join(base_dir, 'metadata')
+    os.makedirs(output_folder, exist_ok=True)
+    definitions_path = find_file_recursive(input_folder, 'definitions.json')
+    metadata_input_path = find_file_recursive(input_folder, 'metadata.json')
+    if not definitions_path or not metadata_input_path:
+        print(f"Error: Could not find 'definitions.json' and/or 'metadata.json' in the folder '{input_folder}'.")
+        return
+    print("Starting script...")
+    print(f"Found definitions file: '{definitions_path}'")
+    print(f"Found metadata file: '{metadata_input_path}'")
+    definition_text = find_definition_data(definitions_path)
+    if not definition_text:
+        print("Could not find the required definition term. Halting script.")
+        return
+    print(f"Found definition: '{definition_text}'. Parsing for currency and amount...")
+    currency, amount = parse_definition(definition_text)
+    if not currency or amount is None:
+        print("Could not parse currency and amount. Halting script.")
+        return
+    print(f"Updating metadata with the new data...")
+    updated_metadata = update_metadata_in_memory(metadata_input_path, currency, amount)
+    if updated_metadata:
+        output_path = os.path.join(output_folder, 'metadata.json')
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(updated_metadata, f, indent=4)
+            print(f"\nSuccessfully saved updated metadata to '{output_path}'")
+        except Exception as e:
+            print(f"An unexpected error occurred while saving the final file: {e}")
+    else:
+        print("Could not proceed with saving the file due to a metadata update failure.")
+if __name__ == '__main__':
+    main()
