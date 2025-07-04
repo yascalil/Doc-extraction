@@ -1,0 +1,181 @@
+import os
+import fitz # type: ignore
+import json
+import re
+import time
+from tqdm import tqdm # type: ignore
+from anthropic import Anthropic # type: ignore
+
+# HARDCODE YOUR API KEY HERE
+ANTHROPIC_API_KEY = 
+MODEL_FOR_SIMPLE_TASKS = "claude-3-7-sonnet-20250219"
+MODEL_FOR_COMPLEX_TASKS = "claude-sonnet-4-20250514"
+DELAY_FOR_SONNET_MODEL = 3
+DELAY_FOR_OPUS_MODEL = 15
+PAGES_PER_CHUNK = 2
+CONTEXT_PAGES = 1
+JSON_SYSTEM_PROMPT = """
+You are a precise data extraction tool specializing in legal documents. Your sole purpose is to return a single, valid JSON object based on the user's query and the provided text.
+You must adhere to the following rules:
+1.  Your entire response MUST be ONLY the JSON object.
+2.  Do not include any introductory sentences, explanations, analysis, or concluding remarks.
+3.  Do not wrap the JSON in markdown backticks (```json) or any other formatting.
+"""
+try:
+    client = Anthropic(api_key=ANTHROPIC_API_KEY, timeout=180.0)
+    if not ANTHROPIC_API_KEY: raise ValueError("ANTHROPIC_API_KEY not set.")
+except Exception as e:
+    print(f"Error initializing Anthropic client: {e}"); exit()
+TOC_PAGE_LIMIT = 10
+INPUT_DIR = "input"
+EXPORT_DIR = "clauses"
+TOC_PROMPT = """
+From the following Table of Contents text, find the "Definitions" section and identify the page number where it starts.
+Return a JSON object with a single key "start_page". For example: { "start_page": 42 }.
+Return ONLY the JSON object.
+"""
+CLAUSES_PROMPT = """
+You are a world-class legal AI specializing in parsing complex contractual documents.
+The user will provide text from a legal document that may contain 'Context Pages' and a 'Main Page'.
+
+Your task is to meticulously extract all top-level clauses and their deeply nested subclauses that BEGIN on the 'Main Page'.
+- The 'Main Page' for this task is: page {main_page_numbers}.
+- Use the 'Context Pages' to understand the hierarchy and to see the beginning of any clause that might continue onto the Main Page.
+- Ensure the 'text' of each clause is full and complete, even if it spans across the context and main pages.
+
+Your output MUST be a JSON object with a single top-level key: "clauses".
+The value of "clauses" must be a list of clause objects.
+
+**Each clause object, at every level of nesting, must have the following keys:**
+- "clause": A string for the clause name/title (e.g., '5. Covenants' or 'Ineligible Obligations').
+- "text": A string for the full text of that specific clause or subclause.
+- "page": An integer for the page number where the clause or subclause BEGINS.
+- "section": A string for the full section identifier (e.g., '5', '5.1', '4.8(a)', '4.8(b)(i)(A)').
+- "subclauses": A list where you will place all nested subclause objects. This list can be empty.
+
+This structure is recursive. A subclause object can have its own "subclauses" list if it contains further nested items.
+
+If no new clauses start on the 'Main Page', return a JSON object where the "clauses" key points to an empty list.
+"""
+def call_claude_api(prompt, text_content, model, system_prompt=None):
+    print(f"\nCalling Claude API with model {model}...")
+    try:
+        print(f"> waiting on api (timeout in {client.timeout} seconds)")
+        message = client.messages.create(
+            model=model, system=system_prompt, max_tokens=8192,
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "text", "text": f"\n\nHere is the text to analyze:\n\n---\n{text_content}\n---"}]}]
+        )
+        print("> got api response")
+        response_text = message.content[0].text; print("> parsing json")
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            print("Error: No JSON object found in the API response."); print("Full response:", response_text); return None
+        json_str = match.group(0)
+        try:
+            parsed_json = json.loads(json_str); print("> parsed json"); return parsed_json
+        except json.JSONDecodeError as e:
+            print(f"> error: api gave a bad json {e}"); return response_text
+    except Exception as e:
+        print(f"error in claude api: {e}")
+        if "Timeout" in str(e): print("> error: api timed out")
+        return None
+    finally:
+        if model == MODEL_FOR_COMPLEX_TASKS:
+            delay = DELAY_FOR_OPUS_MODEL; print(f"> delay: {delay}")
+        else:
+            delay = DELAY_FOR_SONNET_MODEL; print(f"> delay: {delay}")
+        time.sleep(delay)
+def extract_text_from_pdf(pdf_path, start_page=None, end_page=None):
+    text_data = []; doc = fitz.open(pdf_path)
+    p_start = (start_page - 1) if start_page else 0
+    p_end = end_page if end_page else doc.page_count
+    p_start = max(0, p_start); p_end = min(doc.page_count, p_end)
+    for page_num in range(p_start, p_end):
+        page = doc.load_page(page_num); text_data.append((page_num + 1, page.get_text("text")))
+    doc.close()
+    return text_data
+def process_document(pdf_path, base_export_dir, tqdm_write=print):
+    pdf_filename = os.path.basename(pdf_path)
+    pdf_name_only = os.path.splitext(pdf_filename)[0]
+    
+    # Create deal-specific folder
+    deal_folder = os.path.join(EXPORT_DIR, pdf_name_only)
+    os.makedirs(deal_folder, exist_ok=True)
+    
+    tqdm_write(f"Processing: {pdf_path}")
+    toc_text = "".join([p[1] for p in extract_text_from_pdf(pdf_path, end_page=TOC_PAGE_LIMIT)])
+    if not toc_text:
+        tqdm_write("> cant read toc")
+        return
+    toc_pages_json = call_claude_api(TOC_PROMPT, toc_text, model=MODEL_FOR_SIMPLE_TASKS, system_prompt=JSON_SYSTEM_PROMPT)
+    if not isinstance(toc_pages_json, dict) or "start_page" not in toc_pages_json:
+        tqdm_write("> error: cant figure out toc pages")
+        return
+    definitions_start_page = toc_pages_json["start_page"]
+    clauses_end_page = definitions_start_page
+    tqdm_write(f"> defs start on {definitions_start_page}")
+    tqdm_write(f"> proccessing clauses page 1 to page {clauses_end_page}")
+    clause_pages = extract_text_from_pdf(pdf_path, start_page=1, end_page=clauses_end_page)
+    if not clause_pages:
+        tqdm_write("> error: nothing in clauses")
+        return
+    all_clauses = []
+    tqdm_write(f"\nclauses:{len(clause_pages)}, chunks:{PAGES_PER_CHUNK}, context:{CONTEXT_PAGES}")
+
+    # Progress bar for pages
+    with tqdm(total=len(clause_pages), desc="Pages", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as page_bar:
+        for i in range(len(clause_pages)):
+            main_chunk = clause_pages[i : i + PAGES_PER_CHUNK]
+            main_page_numbers = [p[0] for p in main_chunk]
+            context_start_index = max(0, i - CONTEXT_PAGES)
+            context_chunk = clause_pages[context_start_index : i]
+            context_page_numbers = [p[0] for p in context_chunk]
+            tqdm_write(f"> looking at: {main_page_numbers} context: {context_page_numbers})")
+            full_text_for_api = ""
+            for page_num, page_text in context_chunk:
+                full_text_for_api += f"\n\n--- Start of Context Page {page_num} ---\n\n{page_text}\n\n--- End of Context Page {page_num} ---\n\n"
+            for page_num, page_text in main_chunk:
+                full_text_for_api += f"\n\n--- Start of Main Page {page_num} ---\n\n{page_text}\n\n--- End of Main Page {page_num} ---\n\n"
+            page_specific_prompt = CLAUSES_PROMPT.format(main_page_numbers=str(main_page_numbers))
+            api_result = call_claude_api(page_specific_prompt, full_text_for_api, model=MODEL_FOR_COMPLEX_TASKS, system_prompt=JSON_SYSTEM_PROMPT)
+            if isinstance(api_result, dict) and "clauses" in api_result:
+                found_clauses = api_result["clauses"]
+                if found_clauses:
+                    tqdm_write(f"> got {len(found_clauses)} top clauses in this chunk")
+                    all_clauses.extend(found_clauses)
+            elif isinstance(api_result, str):
+                tqdm_write(f"> error: bad json from {main_page_numbers}; saved to debug")
+                debug_filename = os.path.join(deal_folder, f"chunk_{main_page_numbers[0]}-{main_page_numbers[-1]}_malformed.txt")
+                with open(debug_filename, 'w', encoding='utf-8') as f:
+                    f.write(api_result)
+            else:
+                tqdm_write(f"> error: skipped {main_page_numbers} because api error")
+            page_bar.update(1)  # Update progress bar for each page
+
+    if all_clauses:
+        final_json = {"clauses": all_clauses}
+        clauses_filename = os.path.join(deal_folder, "clauses.json")
+        with open(clauses_filename, 'w') as f:
+            json.dump(final_json, f, indent=2)
+        tqdm_write(f"\n> saved {len(all_clauses)} top clauses to {clauses_filename}")
+    else:
+        tqdm_write("\n> error: couldnt find clauses on this page")
+
+if __name__ == "__main__":
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    pdf_files_to_process = []
+    for root, dirs, files in os.walk(INPUT_DIR):
+        for filename in files:
+            if filename.lower().endswith('.pdf'):
+                full_pdf_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(root, INPUT_DIR)
+                output_path_base = os.path.join(EXPORT_DIR, relative_path)
+                pdf_files_to_process.append((full_pdf_path, output_path_base))
+    if not pdf_files_to_process:
+        print(f"no pdf in '{INPUT_DIR}'.")
+    else:
+        print(f"found {len(pdf_files_to_process)} pdfs to convert")
+        for pdf_path, export_base in pdf_files_to_process:
+            process_document(pdf_path, export_base, tqdm_write=tqdm.write)
+    print("\njson finished") 
