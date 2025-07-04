@@ -1,0 +1,141 @@
+import json
+import anthropic
+from pathlib import Path
+from tqdm.auto import tqdm
+from anthropic import Anthropic # type: ignore
+
+# HARDCODE YOUR API KEY HERE
+CLAUDE_API_KEY = 
+MODEL_NAME = "claude-sonnet-4-20250514"
+
+def get_restructuring_prompt(imperfect_json_str: str) -> str:
+    hardcoded_template = """
+{
+    "clause": "2. Main Clause Title",
+    "text": "This is the primary description for the main clause. It acts as an introduction or summary if there are sub-clauses.",
+    "page": 10,
+    "section": "2",
+    "subclauses": [
+        {
+            "clause": "2.1 First Sub-Clause",
+            "text": "This is the detailed text for the first sub-clause.",
+            "page": 10,
+            "section": "2.1",
+            "subclauses": [
+                {
+                    "clause": "(a) Sub-Sub-Clause",
+                    "text": "This text belongs to section 2.1(a).",
+                    "page": 11,
+                    "section": "2.1(a)",
+                    "subclauses": [
+                        {
+                            "clause": "(i) Deepest Nested Clause",
+                            "text": "This text for 2.1(a)(i) shows the deepest level of nesting.",
+                            "page": 11,
+                            "section": "2.1(a)(i)",
+                            "subclauses": []
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "clause": "2.2 Second Sub-Clause",
+            "text": "This is the detailed text for the second sub-clause, a sibling of 2.1. Its 'subclauses' array is empty.",
+            "page": 11,
+            "section": "2.2",
+            "subclauses": []
+        }
+    ]
+}
+"""
+
+    rules = """
+    Your task is to act as an expert paralegal and meticulously correct and consolidate the structure of the provided JSON data. The data comes from a PDF processed in chunks, which has created several specific errors that you must fix. You must follow the numbering hierarchy in the template exactly.
+
+    **Core Rules:**
+
+    1.  **MERGE SPLIT CLAUSES:** The most critical error is that clauses split across page breaks are duplicated.
+        -   You will find two objects with the same "section" number (e.g., "4.2(d)").
+        -   One will have INCOMPLETE text, and the other will have COMPLETE text.
+        -   You MUST merge these. The final, single object for that section must contain the COMPLETE text. Discard the incomplete version.
+
+    2.  **FIX INCORRECT PARENTING:** Top-level clauses whose "section" number clearly indicates they are a sub-point (e.g., "4.2(e)", "2.1(a)") are incorrectly placed.
+        -   You MUST find their logical parent object (e.g., the object for section "4.2" or "2.1").
+        -   Move these orphaned sub-clauses into the `subclauses` array of their correct parent.
+
+    3.  **DEDUPLICATE ENTIRE SECTIONS:** The chunking process may have created complete duplicates of entire sections (e.g., two full "4.2" objects).
+        -   You MUST identify and merge these duplicates. The final output should have only ONE object for each unique section number.
+        -   When merging, ensure you consolidate all their respective sub-clauses into a single, comprehensive `subclauses` array.
+
+    4.  **MAINTAIN HIERARCHY:** The 'text' of a parent clause (e.g., '4.2') should be a simple title. The detailed text belongs in its subclauses. Follow the provided template strictly.
+
+    5.  **SPLIT TEXT INTO SUB-CLAUSES:** If a single clause's "text" field contains an inline list of its own sub-points (e.g., text like "...as follows: (i) the first point; (ii) the second point;..."), you MUST intelligently split it. The parent clause's "text" should ONLY contain the introductory part (e.g., "...as follows:"). Each sub-point (e.g., "(i) the first point;") MUST be extracted and created as its own separate object inside the parent's `subclauses` array, with the correct corresponding "section" and "clause" number (e.g., "5.1(a)(i)"). Do not leave the text of sub-clauses clumped inside the parent's text field.
+
+    6.  **FINAL OUTPUT:** Your final output MUST be only the corrected JSON object, inside a single JSON code block. Do not include any other text, comments, or explanations before or after the JSON block. It must be a single, valid JSON.
+    """
+
+    prompt_parts = [
+        "**TASK:** Correct and consolidate the structure of the following JSON data based on the provided rules and the ideal JSON template. The data is known to have errors from being processed in chunks.",
+        "\n\n**RULES TO FIX CHUNKING ERRORS:**\n",
+        rules,
+        "\n\n**IDEAL JSON TEMPLATE FOR A SINGLE CLAUSE:**\n```json\n",
+        hardcoded_template,
+        "\n```",
+        "\n\n**IMPERFECT JSON DATA TO FIX:**\n```json\n",
+        imperfect_json_str,
+        "\n```",
+        "\n\n**CORRECTED AND CONSOLIDATED JSON DATA:**"
+    ]
+    prompt = "".join(prompt_parts)
+    return prompt
+
+def restructure_json_with_claude(input_path: Path, output_path: Path):
+    if not CLAUDE_API_KEY:
+        print("no env w claude api")
+        return
+    try:
+        output_path.parent.mkdir(exist_ok=True)
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        imperfect_json_str = input_path.read_text(encoding='utf-8')
+        print(f"sending to ({MODEL_NAME})...")
+        prompt = get_restructuring_prompt(imperfect_json_str)
+
+        response_parts = []
+        with client.messages.stream(
+            model=MODEL_NAME,
+            max_tokens=64000,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        ) as stream:
+            print("stream received")
+            progress_bar = tqdm(stream.text_stream, desc="Processing Stream", unit="chunk")
+            for text_chunk in progress_bar:
+                response_parts.append(text_chunk)
+        print("\nstream done, building")
+        corrected_json_str = "".join(response_parts)
+        debug_file_path = Path("debug_claude_response.txt")
+        debug_file_path.write_text(corrected_json_str, encoding='utf-8')
+        if corrected_json_str.strip().startswith("```json"):
+            corrected_json_str = corrected_json_str.strip()[7:-3].strip()
+        parsed_json = json.loads(corrected_json_str)
+        pretty_json = json.dumps(parsed_json, indent=2)
+        output_path.write_text(pretty_json, encoding='utf-8')
+        print(f"saved json to: {output_path}")
+        print(f"debug saved to: {debug_file_path}")
+    except json.JSONDecodeError as e:
+        print("\nparsing error")
+        print(f"   Error: {e}")
+        print(f"   we got a whack response.")
+        print(f"   its there it might run through the debugger: debug_claude_response.txt")
+    except Exception as e:
+        print(f"a unexpected error occurred: {e}")
+
+if __name__ == "__main__":
+    input_file = Path("clauses") / "clauses.json"
+    output_file = Path("clause") / "clauses.json"
+    if not input_file.exists():
+         print(f"❌ Error: cant find '{input_file}'.")
+    else:
+        restructure_json_with_claude(input_file, output_file)
