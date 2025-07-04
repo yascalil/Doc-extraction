@@ -1,0 +1,221 @@
+import os
+import fitz # PyMuPDF
+import json
+import re
+import time
+from tqdm import tqdm
+from anthropic import Anthropic
+
+# HARDCODE YOUR API KEY HERE
+ANTHROPIC_API_KEY = 
+
+MODEL_FOR_SIMPLE_TASKS = "claude-3-7-sonnet-20250219"
+MODEL_FOR_COMPLEX_TASKS = "claude-sonnet-4-20250514"
+DELAY_FOR_SONNET_MODEL = 3
+DELAY_FOR_OPUS_MODEL = 15
+PAGES_PER_CHUNK = 2
+CONTEXT_PAGES = 1
+PAGE_NUMBER_BUFFER = 4
+
+JSON_SYSTEM_PROMPT = """
+You are a precise data extraction tool. Your sole purpose is to return a single, valid JSON object based on the user's query and the provided text.
+You must adhere to the following rules:
+1.  Your entire response MUST be ONLY the JSON object.
+2.  Do not include any introductory sentences, explanations, analysis, or concluding remarks.
+3.  Do not wrap the JSON in markdown backticks (```json) or any other formatting.
+"""
+
+try:
+    client = Anthropic(api_key=ANTHROPIC_API_KEY, timeout=180.0)
+    if not ANTHROPIC_API_KEY: raise ValueError("ANTHROPIC_API_KEY not set.")
+except Exception as e:
+    print(f"Error initializing Anthropic client: {e}")
+    exit()
+
+TOC_PAGE_LIMIT = 10
+METADATA_PAGE_LIMIT = 4
+INPUT_DIR = "input"
+EXPORT_DIR = "defi+meta"
+
+METADATA_PROMPT = """
+Analyze the first few pages of this legal document and extract the following metadata.
+
+- "deal": The name of the deal or transaction.
+- "date": The closing or effective date of the agreement.
+- "parties": A list of the primary parties involved.
+- "country": The country of the credit institution.
+- "asset_class": The type of asset involved.
+- "currency": The primary currency used in the deal.
+- "structure": The type of legal structure.
+- "Initial_Reference_Portfolio_Notional_Amount": The initial notional amount of the reference portfolio, if available.
+
+Return ONLY a valid JSON object. Example:
+{
+  "deal": "WAVE V FINANCE",
+  "date": "2024-11-10",
+  "parties": [
+  "WAVE V FINANCE DESIGNATED ACTIVITY GROUP", "EUROBANK S.A."
+  ],
+  "country": "Greece",
+  "asset_class": "corporate",
+  "currency": "GBP",
+  "structure": "financial guarantee",
+  "Initial_Reference_Portfolio_Notional_Amount": 750,000,000
+}
+"""
+TOC_PROMPT = """
+From the following Table of Contents text, find the "Definitions" section and identify the page number where it starts and the page number where it ends. 
+The end page is typically the page where the next major section begins.
+Return a JSON object with "start_page" and "end_page". For example: { "start_page": 10, "end_page": 45 }.
+Return ONLY the JSON object.
+"""
+DEFINITIONS_PROMPT = """
+You are a legal expert AI. The user will provide text from a legal document that is split into two parts: 'Context Pages' and 'Main Pages'.
+
+Your task is to meticulously extract all defined terms and their full, complete definitions ONLY from the 'Main Pages'.
+- Use the 'Context Pages' to understand the correct section headings and to identify the beginning of any definition that might have started on a previous page.
+- The 'Main Pages' you must extract from are: {main_page_numbers}.
+
+For each definition you extract from the 'Main Pages', provide the following:
+- "term": The defined term.
+- "definition": The full and complete definition text, even if it spans multiple paragraphs.
+- "page": The page number where the definition begins.
+- "section": The precise section heading the term falls under, determined by using the context.
+
+Return ONLY a valid JSON object with a single key "definitions". If no definitions are found on the 'Main Pages', return an empty list: {{"definitions": []}}.
+"""
+
+def call_claude_api(prompt, text_content, model, system_prompt=None):
+    print(f"\ncalling api with model {model}...")
+    try:
+        print(f"-> waiting for api response (timeout in {client.timeout} seconds)...")
+        message = client.messages.create(
+            model=model, system=system_prompt, max_tokens=8192,
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "text", "text": f"\n\nHere is the text to analyze:\n\n---\n{text_content}\n---"}]}]
+        )
+        print("-> api response received.")
+        response_text = message.content[0].text
+        print("-> trying to parse json from response.")
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            print("err: no json found in api response."); print("full response:", response_text); return None
+        json_str = match.group(0)
+        try:
+            parsed_json = json.loads(json_str); print("-> json parsed."); return parsed_json
+        except json.JSONDecodeError as e:
+            print(f"-> err: api gave a malformed json. {e}"); return response_text
+    except Exception as e:
+        print(f"An error occurred with the Claude API call: {e}")
+        if "Timeout" in str(e): print("-> The API call timed out.")
+        return None
+    finally:
+        if model == MODEL_FOR_COMPLEX_TASKS:
+            delay = DELAY_FOR_OPUS_MODEL
+            print(f"-> better model used, waiting for {delay} seconds...")
+        else:
+            delay = DELAY_FOR_SONNET_MODEL
+            print(f"-> smaller model used, waiting for {delay} seconds...")
+        time.sleep(delay)
+
+def extract_text_from_pdf(pdf_path, start_page=None, end_page=None):
+    text_data = []
+    try:
+        doc = fitz.open(pdf_path)
+        p_start = (start_page - 1) if start_page else 0; p_end = end_page if end_page else doc.page_count
+        p_start = max(0, p_start); p_end = min(doc.page_count, p_end)
+        for page_num in range(p_start, p_end):
+            page = doc.load_page(page_num); text_data.append((page_num + 1, page.get_text("text")))
+        doc.close()
+        return text_data
+    except Exception as e:
+        print(f"Error reading PDF file {pdf_path}: {e}"); return []
+
+def process_document(pdf_path, base_export_dir):
+    pdf_filename = os.path.basename(pdf_path); pdf_name_only = os.path.splitext(pdf_filename)[0]
+    specific_output_dir = os.path.join(base_export_dir, pdf_name_only); os.makedirs(specific_output_dir, exist_ok=True)
+    print(f"Processing: {pdf_path}")
+    
+    metadata_text = "".join([p[1] for p in extract_text_from_pdf(pdf_path, end_page=METADATA_PAGE_LIMIT)])
+    if metadata_text:
+        metadata_json = call_claude_api(METADATA_PROMPT, metadata_text, model=MODEL_FOR_SIMPLE_TASKS, system_prompt=JSON_SYSTEM_PROMPT)
+        if isinstance(metadata_json, dict):
+            metadata_filename = os.path.join(specific_output_dir, "metadata.json")
+            with open(metadata_filename, 'w') as f: json.dump(metadata_json, f, indent=2)
+            print(f"-> Saved metadata to {metadata_filename}")
+
+    toc_text = "".join([p[1] for p in extract_text_from_pdf(pdf_path, end_page=TOC_PAGE_LIMIT)])
+    if not toc_text: return
+    toc_pages_json = call_claude_api(TOC_PROMPT, toc_text, model=MODEL_FOR_SIMPLE_TASKS, system_prompt=JSON_SYSTEM_PROMPT)
+    if not isinstance(toc_pages_json, dict) or "start_page" not in toc_pages_json or "end_page" not in toc_pages_json:
+        print("-> Error: Could not determine start/end pages for Definitions from ToC."); return
+    
+    start_page, end_page = toc_pages_json["start_page"], toc_pages_json["end_page"]
+    print(f"-> Located Definitions section in ToC: Pages {start_page}-{end_page}")
+
+    buffered_start_page = max(1, start_page - PAGE_NUMBER_BUFFER)
+    buffered_end_page = end_page + PAGE_NUMBER_BUFFER
+    print(f"-> Applying a {PAGE_NUMBER_BUFFER}-page buffer. New processing range: Pages {buffered_start_page}-{buffered_end_page}")
+
+    definitions_pages = extract_text_from_pdf(pdf_path, start_page=buffered_start_page, end_page=buffered_end_page)
+    if not definitions_pages: return
+
+    all_definitions = []
+    print(f"\nExtracting definitions from {len(definitions_pages)} pages (in chunks of {PAGES_PER_CHUNK} with {CONTEXT_PAGES} context page(s))...")
+
+    for i in range(0, len(definitions_pages), PAGES_PER_CHUNK):
+        main_chunk = definitions_pages[i : i + PAGES_PER_CHUNK]
+        main_page_numbers = [p[0] for p in main_chunk]
+        
+        context_start_index = max(0, i - CONTEXT_PAGES)
+        context_chunk = definitions_pages[context_start_index : i]
+        context_page_numbers = [p[0] for p in context_chunk]
+
+        print(f"--- Analyzing main pages: {main_page_numbers} (with context from pages: {context_page_numbers}) ---")
+
+        full_text_for_api = ""
+        for page_num, page_text in context_chunk:
+            full_text_for_api += f"\n\n--- Start of Context Page {page_num} ---\n\n{page_text}\n\n--- End of Context Page {page_num} ---\n\n"
+        for page_num, page_text in main_chunk:
+            full_text_for_api += f"\n\n--- Start of Main Page {page_num} ---\n\n{page_text}\n\n--- End of Main Page {page_num} ---\n\n"
+
+        page_specific_prompt = DEFINITIONS_PROMPT.format(main_page_numbers=str(main_page_numbers))
+        
+        api_result = call_claude_api(page_specific_prompt, full_text_for_api, model=MODEL_FOR_COMPLEX_TASKS, system_prompt=JSON_SYSTEM_PROMPT)
+        
+        if isinstance(api_result, dict) and "definitions" in api_result:
+            found_defs = api_result["definitions"]
+            if found_defs:
+                print(f"-> Found {len(found_defs)} definition(s) in this chunk.")
+                all_definitions.extend(found_defs)
+        elif isinstance(api_result, str):
+            print(f"-> ERROR: Malformed JSON on chunk for pages {main_page_numbers}. Saving for debug.")
+            debug_filename = os.path.join(specific_output_dir, f"chunk_{main_page_numbers[0]}-{main_page_numbers[-1]}_malformed.txt")
+            with open(debug_filename, 'w', encoding='utf-8') as f: f.write(api_result)
+        else:
+            print(f"-> Skipping chunk for pages {main_page_numbers} due to API error.")
+    
+    if all_definitions:
+        final_json = {"definitions": all_definitions}
+        definitions_filename = os.path.join(specific_output_dir, "definitions.json")
+        with open(definitions_filename, 'w') as f: json.dump(final_json, f, indent=2)
+        print(f"\n-> Successfully saved a total of {len(all_definitions)} definitions to {definitions_filename}")
+    else:
+        print("\n-> No definitions were successfully extracted from any page.")
+
+if __name__ == "__main__":
+    os.makedirs(INPUT_DIR, exist_ok=True); os.makedirs(EXPORT_DIR, exist_ok=True)
+    pdf_files_to_process = []
+    for root, dirs, files in os.walk(INPUT_DIR):
+        for filename in files:
+            if filename.lower().endswith('.pdf'):
+                full_pdf_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(root, INPUT_DIR)
+                output_path_base = os.path.join(EXPORT_DIR, relative_path)
+                pdf_files_to_process.append((full_pdf_path, output_path_base))
+    if not pdf_files_to_process:
+        print(f"No PDF files found in any subdirectories of '{INPUT_DIR}'.")
+    else:
+        print(f"Found {len(pdf_files_to_process)} PDF(s) to process.")
+        for pdf_path, export_base in tqdm(pdf_files_to_process, desc="Processing Documents"):
+            process_document(pdf_path, export_base)
+    print("\n--- All tasks complete. ---")
